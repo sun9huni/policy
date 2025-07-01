@@ -7,3 +7,4 @@ pypdf
 qdrant-client
 google-generativeai
 python-dotenv
+sentence-transformers
