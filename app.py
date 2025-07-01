@@ -4,7 +4,7 @@ import os
 import google.generativeai as genai
 from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
 from langchain_community.document_loaders import PyPDFLoader
-from langchain_community.vectorstores import FAISS
+from langchain_community.vectorstores import Qdrant
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.prompts import PromptTemplate
 from langchain_core.runnables import RunnablePassthrough
@@ -41,9 +41,8 @@ div[data-testid="stSidebar"] .stButton > button:hover {
 </style>
 """, unsafe_allow_html=True)
 
-# --- 2. 백엔드 로직: RAG 파이프라인 설정 (FAISS 사용) ---
+# --- 2. 백엔드 로직: RAG 파이프라인 설정 (Qdrant 사용) ---
 
-DB_PATH = "./faiss_index"
 DATA_PATH = "./data"
 
 def check_api_key():
@@ -56,10 +55,17 @@ def check_api_key():
         st.info("Streamlit Cloud 배포 시, 앱 설정의 'Secrets'에 GOOGLE_API_KEY를 추가해야 합니다.")
         st.stop()
 
-def create_and_load_db(embedding_function):
-    """데이터베이스를 생성하고 로드하는 함수."""
-    st.sidebar.info("새로운 데이터베이스를 구축하고 있습니다. 잠시만 기다려주세요...")
-    
+@st.cache_resource
+def get_rag_pipeline():
+    """
+    RAG 파이프라인 전체를 설정하고 반환하는 함수.
+    앱 시작 시 한 번만 실행되며, 결과는 캐시에 저장됩니다.
+    """
+    # 1. API 키 확인
+    check_api_key()
+
+    # 2. PDF 문서 로드 및 분할
+    st.sidebar.info("문서를 로드하고 있습니다...")
     if not os.path.exists(DATA_PATH) or not any(f.endswith('.pdf') for f in os.listdir(DATA_PATH)):
         st.error(f"오류: '{DATA_PATH}' 폴더를 찾을 수 없거나 폴더 내에 PDF 파일이 없습니다.")
         st.info("배포 시, GitHub 리포지토리에 'data' 폴더와 그 안에 PDF 파일을 포함해야 합니다.")
@@ -73,26 +79,22 @@ def create_and_load_db(embedding_function):
     
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
     texts = text_splitter.split_documents(documents)
+    st.sidebar.info("데이터베이스를 구축하고 있습니다...")
 
-    vectorstore = FAISS.from_documents(documents=texts, embedding=embedding_function)
-    vectorstore.save_local(DB_PATH) # FAISS는 save_local을 사용
-    st.sidebar.success("데이터베이스 구축 완료!")
-    return vectorstore
-
-@st.cache_resource
-def get_rag_pipeline():
-    """RAG 파이프라인 전체를 설정하고 반환하는 함수."""
-    check_api_key()
+    # 3. 임베딩 모델 및 벡터 데이터베이스(Qdrant) 설정
     embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
-
-    if os.path.exists(DB_PATH):
-        st.sidebar.info("기존 데이터베이스를 로드했습니다.")
-        vectorstore = FAISS.load_local(DB_PATH, embeddings, allow_dangerous_deserialization=True)
-    else:
-        vectorstore = create_and_load_db(embeddings)
-
+    
+    # Qdrant를 인메모리 모드로 사용. 디스크 저장/로드 과정이 없어 배포 안정성 향상.
+    vectorstore = Qdrant.from_documents(
+        texts,
+        embeddings,
+        location=":memory:",  # 인메모리 DB 사용
+        collection_name="policy_documents",
+    )
     retriever = vectorstore.as_retriever()
+    st.sidebar.success("데이터베이스 구축 완료!")
 
+    # 4. LLM 및 프롬프트 설정
     llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0.1)
     
     template = """당신은 대한민국 정부 정책 전문가입니다. 사용자의 질문에 대해 아래의 '문서 내용'을 바탕으로, 명확하고 친절하게 답변해주세요.
@@ -105,6 +107,7 @@ def get_rag_pipeline():
     """
     prompt_template = PromptTemplate.from_template(template)
 
+    # 5. RAG 체인 구성
     rag_chain = (
         {"context": retriever, "question": RunnablePassthrough()}
         | prompt_template
