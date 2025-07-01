@@ -8,11 +8,12 @@ from langchain_community.vectorstores import Qdrant
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
+from sentence_transformers import CrossEncoder
 
 # --- 1. 페이지 기본 설정 및 CSS ---
 st.set_page_config(
     page_title="정책 큐레이터",
-    page_icon="🤖",
+    page_icon="�",
     layout="wide"
 )
 
@@ -60,10 +61,8 @@ def get_rag_components():
     RAG 파이프라인의 핵심 구성 요소들을 설정하고 반환합니다.
     앱 시작 시 한 번만 실행되며, 결과는 캐시에 저장됩니다.
     """
-    # 1. API 키 확인
     check_api_key()
 
-    # 2. PDF 문서 로드 및 분할
     st.sidebar.info("문서를 로드하고 있습니다...")
     if not os.path.exists(DATA_PATH) or not any(f.endswith('.pdf') for f in os.listdir(DATA_PATH)):
         st.error(f"오류: '{DATA_PATH}' 폴더를 찾을 수 없거나 폴더 내에 PDF 파일이 없습니다.")
@@ -80,16 +79,13 @@ def get_rag_components():
     texts = text_splitter.split_documents(documents)
     st.sidebar.info("데이터베이스를 구축하고 있습니다...")
 
-    # 3. 임베딩 모델 및 벡터 데이터베이스(Qdrant) 설정
     embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
-    
     vectorstore = Qdrant.from_documents(
         texts, embeddings, location=":memory:", collection_name="policy_documents",
     )
-    retriever = vectorstore.as_retriever()
+    retriever = vectorstore.as_retriever(search_kwargs={'k': 10}) # [개선] 더 많은 후보군 확보를 위해 k값 증가
     st.sidebar.success("데이터베이스 구축 완료!")
 
-    # 4. LLM 및 프롬프트 템플릿 설정
     llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0.1)
     
     prompt_template = PromptTemplate.from_template(
@@ -103,11 +99,16 @@ def get_rag_components():
         """
     )
     
-    return retriever, llm, prompt_template
+    # [개선] Re-ranker 모델 로드 추가
+    st.sidebar.info("Re-ranker 모델을 로드하고 있습니다...")
+    reranker_model = CrossEncoder('kc-kim/ko-cross-encoder-v1')
+    st.sidebar.success("모든 컴포넌트 로드 완료!")
+    
+    return retriever, llm, prompt_template, reranker_model
 
 # --- 3. 애플리케이션 실행 ---
 try:
-    retriever, llm, prompt_template = get_rag_components()
+    retriever, llm, prompt_template, reranker_model = get_rag_components()
 except Exception as e:
     st.error(f"RAG 구성 요소를 설정하는 중 심각한 오류가 발생했습니다: {e}")
     st.stop()
@@ -184,41 +185,51 @@ if prompt:
 
     # AI 응답 생성
     with st.chat_message("assistant"):
-        with st.spinner("질문을 분석하고 답변을 생성하는 중입니다..."):
+        with st.spinner("질문을 분석하고 관련 정보를 찾는 중입니다..."):
             try:
-                # --- [개선] 쿼리 확장(Query Expansion) 단계 ---
+                # --- 1. 쿼리 확장(Query Expansion) 단계 ---
                 expansion_prompt = PromptTemplate.from_template(
                     """당신은 한국 정부 정책 관련 검색어 생성 전문가입니다.
-                    사용자의 질문을 보고, 관련성이 높은 검색어를 3개 생성해주세요.
+                    사용자의 질문을 보고, 관련성이 높은 검색어를 2개 생성해주세요.
                     공식 명칭, 동의어, 약어 등을 포함해야 합니다.
                     결과는 쉼표로 구분된 하나의 문자열로만 응답해주세요.
-                    예시: 청년내일채움공제, 내일채움공제, 청년 공제
                     질문: {question}"""
                 )
                 query_expansion_chain = expansion_prompt | llm | StrOutputParser()
                 expanded_queries_str = query_expansion_chain.invoke({"question": prompt})
-                expanded_queries = [q.strip() for q in expanded_queries_str.split(',')]
-                
-                # 디버깅을 위해 확장된 쿼리 표시 (실제 서비스에서는 주석 처리 가능)
-                # st.sidebar.write("확장된 검색어:", expanded_queries)
+                # 원본 질문과 확장된 질문을 모두 사용
+                expanded_queries = [prompt] + [q.strip() for q in expanded_queries_str.split(',') if q.strip()]
 
-                # --- [개선] 확장된 검색(Expanded Retrieval) 단계 ---
+                # --- 2. 확장된 검색(Expanded Retrieval) 단계 ---
                 all_retrieved_docs = []
                 for q in expanded_queries:
                     all_retrieved_docs.extend(retriever.invoke(q))
                 
                 # 중복된 문서 제거
-                unique_docs = {doc.page_content: doc for doc in all_retrieved_docs}.values()
+                unique_docs = list({doc.page_content: doc for doc in all_retrieved_docs}.values())
                 
-                # --- [개선] 최종 답변 생성 단계 ---
-                context = "\n\n".join(doc.page_content for doc in unique_docs)
-                final_prompt = prompt_template.format(context=context, question=prompt)
-                
-                response = llm.invoke(final_prompt).content
+                # --- 3. [개선] Re-ranking 단계 ---
+                final_docs = []
+                if unique_docs:
+                    st.spinner("찾은 정보의 정확도를 높이는 중입니다...")
+                    pairs = [[prompt, doc.page_content] for doc in unique_docs]
+                    scores = reranker_model.predict(pairs)
+                    
+                    doc_scores = sorted(zip(scores, unique_docs), key=lambda x: x[0], reverse=True)
+                    # 재정렬된 문서 중 상위 3개만 선택
+                    final_docs = [doc for score, doc in doc_scores[:3]]
+
+                # --- 4. 최종 답변 생성 단계 ---
+                if final_docs:
+                    context = "\n\n".join(doc.page_content for doc in final_docs)
+                    final_prompt = prompt_template.format(context=context, question=prompt)
+                    response = llm.invoke(final_prompt).content
+                else:
+                    response = "죄송합니다. 관련 문서를 찾을 수 없어 답변을 생성할 수 없습니다. 더 많은 문서를 추가하면 답변 품질이 향상됩니다."
                 
                 st.markdown(response)
                 st.session_state.messages.append({
-                    "role": "assistant", "content": response, "sources": list(unique_docs)
+                    "role": "assistant", "content": response, "sources": final_docs
                 })
             except Exception as e:
                 error_message = f"답변 생성 중 오류가 발생했습니다: {e}"
