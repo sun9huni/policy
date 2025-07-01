@@ -7,7 +7,6 @@ from langchain_community.document_loaders import PyPDFLoader
 from langchain_community.vectorstores import Qdrant
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.prompts import PromptTemplate
-from langchain_core.runnables import RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
 
 # --- 1. 페이지 기본 설정 및 CSS ---
@@ -41,7 +40,7 @@ div[data-testid="stSidebar"] .stButton > button:hover {
 </style>
 """, unsafe_allow_html=True)
 
-# --- 2. 백엔드 로직: RAG 파이프라인 설정 (Qdrant 사용) ---
+# --- 2. 백엔드 로직: RAG 파이프라인 설정 ---
 
 DATA_PATH = "./data"
 
@@ -56,9 +55,9 @@ def check_api_key():
         st.stop()
 
 @st.cache_resource
-def get_rag_pipeline():
+def get_rag_components():
     """
-    RAG 파이프라인 전체를 설정하고 반환하는 함수.
+    RAG 파이프라인의 핵심 구성 요소들을 설정하고 반환합니다.
     앱 시작 시 한 번만 실행되며, 결과는 캐시에 저장됩니다.
     """
     # 1. API 키 확인
@@ -84,46 +83,36 @@ def get_rag_pipeline():
     # 3. 임베딩 모델 및 벡터 데이터베이스(Qdrant) 설정
     embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
     
-    # Qdrant를 인메모리 모드로 사용. 디스크 저장/로드 과정이 없어 배포 안정성 향상.
     vectorstore = Qdrant.from_documents(
-        texts,
-        embeddings,
-        location=":memory:",  # 인메모리 DB 사용
-        collection_name="policy_documents",
+        texts, embeddings, location=":memory:", collection_name="policy_documents",
     )
     retriever = vectorstore.as_retriever()
     st.sidebar.success("데이터베이스 구축 완료!")
 
-    # 4. LLM 및 프롬프트 설정
+    # 4. LLM 및 프롬프트 템플릿 설정
     llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0.1)
     
-    template = """당신은 대한민국 정부 정책 전문가입니다. 사용자의 질문에 대해 아래의 '문서 내용'을 바탕으로, 명확하고 친절하게 답변해주세요.
-    답변은 항상 한국어로 작성해야 합니다. 문서 내용에 없는 정보는 답변에 포함하지 마세요.
-    [문서 내용]
-    {context}
-    [사용자 질문]
-    {question}
-    [답변]
-    """
-    prompt_template = PromptTemplate.from_template(template)
-
-    # 5. RAG 체인 구성
-    rag_chain = (
-        {"context": retriever, "question": RunnablePassthrough()}
-        | prompt_template
-        | llm
-        | StrOutputParser()
+    prompt_template = PromptTemplate.from_template(
+        """당신은 대한민국 정부 정책 전문가입니다. 사용자의 질문에 대해 아래의 '문서 내용'을 바탕으로, 명확하고 친절하게 답변해주세요.
+        답변은 항상 한국어로 작성해야 합니다. 문서 내용에 없는 정보는 답변에 포함하지 마세요.
+        [문서 내용]
+        {context}
+        [사용자 질문]
+        {question}
+        [답변]
+        """
     )
     
-    return rag_chain, retriever
+    return retriever, llm, prompt_template
 
 # --- 3. 애플리케이션 실행 ---
 try:
-    rag_chain, retriever = get_rag_pipeline()
+    retriever, llm, prompt_template = get_rag_components()
 except Exception as e:
-    st.error(f"RAG 파이프라인을 설정하는 중 심각한 오류가 발생했습니다: {e}")
+    st.error(f"RAG 구성 요소를 설정하는 중 심각한 오류가 발생했습니다: {e}")
     st.stop()
 
+# 세션 상태 초기화
 if "messages" not in st.session_state:
     st.session_state.messages = []
 if "profile" not in st.session_state:
@@ -131,6 +120,7 @@ if "profile" not in st.session_state:
 if "selected_question" not in st.session_state:
     st.session_state.selected_question = None
 
+# 좌측 사이드바 UI
 with st.sidebar:
     st.header("🎯 나의 맞춤 조건 설정")
     st.markdown("AI가 더 정확한 정책을 추천하도록 정보를 입력해주세요.")
@@ -146,9 +136,11 @@ with st.sidebar:
         time.sleep(1)
         st.rerun()
 
+# 메인 화면 UI
 st.title("🤖 정책 큐레이터")
 st.caption("AI 기반 맞춤형 정책 탐색기")
 
+# 추천 질문
 recommended_questions_db = {
     "주거 지원": ["청년 월세 지원 자격 알려줘", "신혼부부 전세 대출 조건"],
     "일자리/창업": ["창업 지원금 종류 알려줘", "내일채움공제 신청 방법"],
@@ -161,11 +153,15 @@ for i, question in enumerate(questions_to_show):
     if cols[i].button(question, use_container_width=True, key=f"rec_q_{i}"):
         st.session_state.selected_question = question
 
+# 채팅 인터페이스 로직
+
+# 동적 온보딩 메시지
 if not st.session_state.messages:
     profile = st.session_state.get("profile", {})
     welcome_message = f"안녕하세요! {profile['age']}세, '{profile['interests'][0]}' 분야에 관심이 있으시군요." if profile.get("age") and profile.get("interests") else "안녕하세요! 어떤 정책이 궁금하신가요?"
     st.session_state.messages.append({"role": "assistant", "content": welcome_message})
 
+# 이전 대화 기록 표시
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
@@ -175,6 +171,7 @@ for message in st.session_state.messages:
                     st.info(f"출처: {source.metadata.get('source', 'N/A')} (페이지: {source.metadata.get('page', 'N/A')})")
                     st.write(source.page_content)
 
+# 사용자 입력 처리
 prompt = st.chat_input("궁금한 정책에 대해 질문해보세요.")
 if st.session_state.selected_question:
     prompt = st.session_state.selected_question
@@ -185,14 +182,43 @@ if prompt:
     with st.chat_message("user"):
         st.markdown(prompt)
 
+    # AI 응답 생성
     with st.chat_message("assistant"):
-        with st.spinner("답변을 생성하는 중입니다..."):
+        with st.spinner("질문을 분석하고 답변을 생성하는 중입니다..."):
             try:
-                response = rag_chain.invoke(prompt)
-                sources = retriever.invoke(prompt)
+                # --- [개선] 쿼리 확장(Query Expansion) 단계 ---
+                expansion_prompt = PromptTemplate.from_template(
+                    """당신은 한국 정부 정책 관련 검색어 생성 전문가입니다.
+                    사용자의 질문을 보고, 관련성이 높은 검색어를 3개 생성해주세요.
+                    공식 명칭, 동의어, 약어 등을 포함해야 합니다.
+                    결과는 쉼표로 구분된 하나의 문자열로만 응답해주세요.
+                    예시: 청년내일채움공제, 내일채움공제, 청년 공제
+                    질문: {question}"""
+                )
+                query_expansion_chain = expansion_prompt | llm | StrOutputParser()
+                expanded_queries_str = query_expansion_chain.invoke({"question": prompt})
+                expanded_queries = [q.strip() for q in expanded_queries_str.split(',')]
+                
+                # 디버깅을 위해 확장된 쿼리 표시 (실제 서비스에서는 주석 처리 가능)
+                # st.sidebar.write("확장된 검색어:", expanded_queries)
+
+                # --- [개선] 확장된 검색(Expanded Retrieval) 단계 ---
+                all_retrieved_docs = []
+                for q in expanded_queries:
+                    all_retrieved_docs.extend(retriever.invoke(q))
+                
+                # 중복된 문서 제거
+                unique_docs = {doc.page_content: doc for doc in all_retrieved_docs}.values()
+                
+                # --- [개선] 최종 답변 생성 단계 ---
+                context = "\n\n".join(doc.page_content for doc in unique_docs)
+                final_prompt = prompt_template.format(context=context, question=prompt)
+                
+                response = llm.invoke(final_prompt).content
+                
                 st.markdown(response)
                 st.session_state.messages.append({
-                    "role": "assistant", "content": response, "sources": sources
+                    "role": "assistant", "content": response, "sources": list(unique_docs)
                 })
             except Exception as e:
                 error_message = f"답변 생성 중 오류가 발생했습니다: {e}"
