@@ -13,7 +13,7 @@ from sentence_transformers import CrossEncoder
 # --- 1. 페이지 기본 설정 및 CSS ---
 st.set_page_config(
     page_title="정책 큐레이터",
-    page_icon="�",
+    page_icon="🤖",
     layout="wide"
 )
 
@@ -99,9 +99,9 @@ def get_rag_components():
         """
     )
     
-    # [개선] Re-ranker 모델 로드 추가
+    # [개선] Re-ranker 모델 로드 추가 (안정적인 모델로 변경)
     st.sidebar.info("Re-ranker 모델을 로드하고 있습니다...")
-    reranker_model = CrossEncoder('kc-kim/ko-cross-encoder-v1')
+    reranker_model = CrossEncoder('bongsoo/kpf-cross-encoder-v1')
     st.sidebar.success("모든 컴포넌트 로드 완료!")
     
     return retriever, llm, prompt_template, reranker_model
