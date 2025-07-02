@@ -128,7 +128,7 @@ with st.sidebar:
     age = st.number_input("나이(만)", min_value=18, max_value=100, value=st.session_state.profile.get("age", 25))
     interests = st.multiselect(
         "주요 관심 분야",
-        ['주거 지원', '일자리/창업', '금융/자산 형성', '생활/복지'],
+        ['주거', '일자리/창업', '금융/자산', '복지/문화'],
         default=st.session_state.profile.get("interests", [])
     )
     if st.button("✅ 조건 저장 및 반영", type="primary", use_container_width=True):
