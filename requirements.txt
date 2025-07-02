@@ -1,11 +1,10 @@
 streamlit
 langchain
-langchain-openai
+langchain-google-genai
 langchain-community
 langchain-text-splitters
 pypdf
 qdrant-client
-openai
+google-generativeai
 python-dotenv
 sentence-transformers
-tiktoken
